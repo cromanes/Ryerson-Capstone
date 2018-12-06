@@ -1,0 +1,1030 @@
+---
+title: "Lending Club - Data Preparation"
+author: "Constantin Romanescu"
+date: "October 30, 2018"
+output:
+  word_document: 
+    toc: yes
+  pdf_document: default
+  html_document: default
+---
+
+# Set up the R environment
+```{r setup, results = 'hide', warning=FALSE, message=FALSE, cached = TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Install the R packages for the project
+packages = c('ggplot2', 'tidyverse', 'caret', 'caTools', 'GGaly', 'dplyr', 'readxl', 'lubridate', 'knitr',
+             'devtools', 'mapproj', 'gridExtra', 'moments', 'nortest', 'Boruta', 'CORElearn')
+
+for (package in packages){
+    if(!(package %in% installed.packages()[,"Package"])) {
+    install.packages(package, repos = "http://cran.rstudio.com/")
+    }
+}
+
+if(!('fiftystater' %in% installed.packages()[,"Package"])) {
+  devtools::install_github("wmurphyrd/fiftystater")
+    }
+
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(caret)
+library(caTools)
+library(readxl)
+library(lubridate)
+library(knitr)
+library(fiftystater)
+library(mapproj)
+library(gridExtra)
+library(corrplot)
+library(moments)
+library(nortest)
+library(Boruta)
+library(CORElearn)
+```
+
+# 1. Data Collection and Business Understanding
+## Load data
+Lending Club publishes the data collected for the loans they have offered since 2007. The data is stored in smaller files, grouped by the date the transactions occured. As of October, 2018, the data includes the loans issued up to the second quarter of 2018, in 14 csv files at https://www.lendingclub.com/info/download-data.action. A description of the data features is available as an excel file at https://resources.lendingclub.com/LCDataDictionary.xlsx. 
+
+Since it is not possible to read the data directly from the web through an API without a Lending Club account, we manually downloaded the files, combined them into a single data frame, and stored it on the local disk (data_2007_2018Q2.csv).
+
+
+
+```{r raw_data, cached = TRUE, message=FALSE}
+if(file.exists("C:\\Ryerson Capstone\\data\\LC\\data_2007_2018Q2.csv")) {
+  data <- read_csv("C:\\Ryerson Capstone\\data\\LC\\data_2007_2018Q2.csv")
+} else {
+  # choose file from a different location
+  data <- read_csv(file = file.choose())
+}
+
+# Updated data for 2015 released in Nov. 2018
+if(file.exists("C:\\Ryerson Capstone\\data\\LC\\LC_2015_Nov2018.csv")) {
+  data_2015_updated <- read_csv("C:\\Ryerson Capstone\\data\\LC\\LC_2015_Nov2018.csv")
+} else {
+  # choose file from a different location
+  data_2015_updated <- read_csv(file = file.choose())
+}
+```
+The dataset consists of `r nrow(data)` observations and `r ncol(data)` features. Our primary target variable is *loan_status*. Later we will also look at the total payments received for each loan, encoded as *total_pymnt*.
+Not all the features are available at the time a loan is listed. Some features are added later to keep track of the loan repayment history and to add or update features in borrower's profile. Due to the sheer volume of the data, we defer data summarization and visualization to later sections.
+
+An important note is that 6 features from the loan description are missing from our data. These features contain ranges of FICO scores for the primary and secondary applicants. Although these are important features in predicting the payment of a loan, they are also correlated with the Lending Club rating and the interest rate assigned to each loan. Complete datasets are, also, available on Kaggle. (https://www.kaggle.com/wordsforthewise/lending-club) 
+
+Let's look at the distribution of the target variable, **loan_status**.
+
+```{r}
+loan_status_count <- data %>%
+  select(loan_status) %>%
+  group_by(loan_status) %>%
+  summarize(Count = n()) %>%
+  mutate(Percentage = round(100* Count/nrow(data), 3)) %>% 
+  arrange(desc(Count)) %>%
+  ungroup()
+
+knitr::kable(loan_status_count, caption = 'Table 1: Loan status')
+```
+
+Not suprisingly, due to the boom in the P2P lending in the recent years, a large fraction of the loans are current loans. There are a number of loans that are late (~ 2%), that can also be classified as current loans. Note that the default category refers to loans that are late (120 - 150 days). A loan is classified as *Charged Off* if an installment is not payed after 150 days from the payment due date.
+
+Based on the data description and literature studies (Cohen, Guetta, Jiao, & Provost, 2018), we define a list of features that are available to investors at the time a loan is listed, plus some features that will be use as target variables (*loan-Status*, *total_pymnt*) or help in interpreting the dynamics of loan payment, *last_pymnt_d*. For now we'll keep only the loans in the first three categories.
+
+
+```{r, cached = TRUE}
+features_of_interest <- c('loan_amnt', 'term', 'int_rate', 'installment', 'grade', 'sub_grade', 'purpose',
+                      'verification_status', 'home_ownership', 'emp_title', 'emp_length', 'zip_code',
+                      'addr_state', 'annual_inc', 'dti', 'dti_joint', 'annual_inc_joint', 'earliest_cr_line',
+                      'open_acc', 'total_acc', 'num_sats', 'pub_rec', 'revol_bal', 'revol_util', 'delinq_2yrs',
+                      'recoveries', 'mths_since_last_delinq', 'mths_since_last_major_derog',
+                      'collections_12_mths_ex_med', 'mths_since_last_record', 'issue_d', 'loan_status',
+                      'total_pymnt', 'last_pymnt_d', 'recoveries')
+
+data_preproc <- data %>% select(features_of_interest) %>%
+  filter(loan_status %in% c('Fully Paid', 'Charged Off', 'Current'))
+new_data_preproc <- data_2015_updated %>% select(features_of_interest) %>%
+  filter(loan_status %in% c('Fully Paid', 'Charged Off', 'Current'))
+
+# glimpse(data_preproc)
+```
+
+
+## Change feature data formats. Transform existing features
+
+Now we'll convert the features that contain dates into Date format and the features that contain percent data (*int_rate*, *revol_util*) into numeric format. Also, we introduce two new variables: length of credit history and the number of month a loan has been on the book.
+
+```{r, warning=FALSE}
+data_preproc$loan_status <- gsub(" ", ".", data_preproc$loan_status)
+new_data_preproc$loan_status <- gsub(" ", ".", new_data_preproc$loan_status)
+
+data_preproc <- data_preproc %>%
+  mutate(issue_d = dmy(paste0('01-', issue_d))) %>%
+  mutate(earliest_cr_line = dmy(paste0('01-', earliest_cr_line))) %>%
+  mutate(last_pymnt_d = dmy(paste0('01-', last_pymnt_d)))
+
+new_data_preproc <- new_data_preproc %>%
+  mutate(issue_d = dmy(paste0('01-', issue_d))) %>%
+  mutate(earliest_cr_line = dmy(paste0('01-', earliest_cr_line))) %>%
+  mutate(last_pymnt_d = dmy(paste0('01-', last_pymnt_d)))
+
+##  Extract the float number from int_rate and revol_util
+data_preproc$int_rate <- as.numeric(gsub("(.+)%$", "\\1", data_preproc$int_rate))
+data_preproc$revol_util <- as.numeric(gsub("(.+)%$", "\\1", data_preproc$revol_util))
+
+new_data_preproc$int_rate <- as.numeric(gsub("(.+)%$", "\\1", new_data_preproc$int_rate))
+new_data_preproc$revol_util <- as.numeric(gsub("(.+)%$", "\\1", new_data_preproc$revol_util))
+
+# Create new variables: Months-on-book (MOB), length of credit history
+data_preproc <- data_preproc %>%
+  mutate(Credit_history = 12*(year(issue_d)-year(earliest_cr_line)) + (month(issue_d)-month(earliest_cr_line))) %>%
+  mutate(MOB = 12*(year(last_pymnt_d)-year(issue_d)) + (month(last_pymnt_d)-month(issue_d))) %>%
+  filter(!is.na(MOB)) %>%
+  select(-earliest_cr_line)
+
+new_data_preproc <- new_data_preproc %>%
+  mutate(Credit_history = 12*(year(issue_d)-year(earliest_cr_line)) + (month(issue_d)-month(earliest_cr_line))) %>%
+  mutate(MOB = 12*(year(last_pymnt_d)-year(issue_d)) + (month(last_pymnt_d)-month(issue_d))) %>%
+  filter(!is.na(MOB)) %>%
+  select(-earliest_cr_line)
+
+# Convert string variables to numeric
+should_be_numeric <- c('dti_joint', 'annual_inc_joint')
+
+for (col in should_be_numeric) {
+  data_preproc[[col]] <- as.numeric(data_preproc[[col]])
+  new_data_preproc[[col]] <- as.numeric(new_data_preproc[[col]])
+}
+
+#Convert some numeric variables to integers
+
+should_be_integers <- c( 'num_sats', 'mths_since_last_major_derog', 'Credit_history', 'MOB')
+
+for (col in should_be_integers) {
+  # data_preproc[[col]] <- as.integer(data_preproc[[col]])
+  new_data_preproc[[col]] <- as.integer(new_data_preproc[[col]])
+}
+
+glimpse(data_preproc)
+```
+
+
+Now all the features have the right format. Before cleaning the data, we'll investigate the number of loans and the default rate both as a function of location and time.
+
+## Loan counts and default rates by state
+```{r, warning = FALSE}
+data.by.states <- data_preproc %>% filter(loan_status %in% c('Fully.Paid', 'Charged.Off')) %>%
+  select(addr_state, loan_status) %>%
+  group_by(addr_state, loan_status) %>%
+  summarise(count=n()) %>%
+  ungroup() %>%
+  spread(loan_status, count) %>%
+  mutate(count = (Charged.Off + Fully.Paid), Charged.Off = ifelse(is.na(Charged.Off), 0, Charged.Off), default_ratio = Charged.Off/ (Charged.Off + Fully.Paid)) %>%
+  select(count, state = addr_state, default_ratio, count)
+
+data.by.states$id <- tolower(state.name[match(data.by.states$state,state.abb)])
+data.by.states$id[data.by.states$state == "DC"] <- "district of columbia"
+
+# loans count
+data.by.states$count_bins <- cut(data.by.states$count, breaks = c(0, 10000, 25000, 50000, 100000, 200000), 
+                                 labels = c('< 10K', '10k - 25k', '25k - 50k', '50k - 100k', 'over 100k'))
+data.by.states$default_bins <- cut(data.by.states$default_ratio, breaks = c(0.1, 0.15, 0.2, 0.25, 1),
+                                   labels = c('0.1 - 0.15', '0.151 - 0.2', '0.201 - 0.25', 'over 0.25'))
+
+
+# Merge map and count/ default data
+us <- merge(fifty_states, data.by.states, by = "id")
+
+# Create a map
+us$bucket <- cut(us$default_ratio, breaks = c(0, 0.1, 0.15, 0.2, 1))
+
+plot_states <- function(feature){
+  ggplot(us) + 
+  geom_map(aes(map_id = id, fill = us[[feature]]), col = "grey20", size = .2, map = us) + 
+  expand_limits(x = fifty_states$long, y = fifty_states$lat) +
+  coord_map() +
+  scale_fill_brewer("", palette = "Reds") +
+  scale_x_continuous(breaks = NULL) + 
+  scale_y_continuous(breaks = NULL) +
+  labs(x = "", y = "") +
+  ggtitle(ifelse(grepl('default', feature), 'Default Rates by State', 'Loans by State')) +
+  theme(legend.text = element_text(family = "Gill Sans MT"),
+        legend.position = "bottom",
+        panel.background = element_blank(),
+        plot.title = element_text(family = "Gill Sans MT"))
+  
+}
+# grid.arrange(plot_states('count_bins'), plot_states('default_bins'), ncol = 2)
+plot_states('count_bins')
+plot_states('default_bins')
+
+# Change the nale from addr_state to State
+data_preproc <- data_preproc %>% mutate(State = addr_state) %>% select(-addr_state)
+```
+
+Not surprisingly, the largest US states (CA, TX, NY, FL) have more loans than the other states. The default rate is higher in states with a few loans (Nebraska, Mississippi). 
+
+## Time-dependence of the loan status. Observations selection
+```{r, message=FALSE, warning=FALSE}
+# tmp <- data_preproc
+# tmp -> data_preproc
+
+data_preproc <- data_preproc %>%
+  mutate(status_3way = ifelse(loan_status == 'Charged.Off', 'Charged.Off',
+  ifelse(((MOB < 36 & term == '36 months') |(MOB < 60 & term == '60 months') |
+            (issue_d > '2013-06-01' & term == '60 months') |(issue_d > '2015-06-01' & term == '36 months')), 'Prepaid', 'Fully.Paid'))) %>%
+  mutate(status_3way = ifelse(loan_status == 'Current', 'Current', status_3way))
+
+new_data_preproc <- new_data_preproc %>% 
+  mutate(status_3way = ifelse(loan_status == 'Charged.Off', 'Charged.Off',
+  ifelse(((MOB < 36 & term == '36 months') |(MOB < 60 & term == '60 months')), 'Prepaid', 'Fully.Paid'))) %>%
+  mutate(status_3way = ifelse(loan_status == 'Current', 'Current', status_3way))
+
+## Look at the time dependence of loan status
+loan_status_trend <- data_preproc %>% select(issue_d, loan_status) %>% 
+  group_by(issue_d, loan_status) %>%
+  summarize(count = n()) %>% 
+  spread(loan_status, count) %>% 
+  mutate(default_ratio = Charged.Off/ (Charged.Off + Fully.Paid), current = Current/ (Current + Charged.Off + Fully.Paid), sum_solved = sum(Charged.Off, Fully.Paid,na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(cum_ratio = cumsum(sum_solved)/sum(sum_solved)) %>% select(-sum_solved)
+
+loan_status_trend2 <- data_preproc %>% select(issue_d, status_3way) %>% 
+  group_by(issue_d, status_3way) %>%
+  summarize(count = n()) %>% 
+  spread(status_3way, count) %>% 
+  mutate(prepay_ratio = Prepaid/ (Prepaid + Fully.Paid)) %>%
+  ungroup()
+
+# loan_status_trend
+
+plt1 <- ggplot(data = loan_status_trend, aes(x = issue_d, y = default_ratio), alpha = 0.6) +
+  geom_point() +
+  geom_point(aes(x = issue_d, y = current), color='blue', alpha = 0.6) +
+  geom_point(data = loan_status_trend2, aes(x = issue_d, y = prepay_ratio), color='red', alpha = 0.6) +
+  theme_bw() +
+  geom_vline(xintercept = c(date('2013-07-01'), date('2015-07-01')), linetype="dashed") +
+  ggtitle("Loan status vs. issue date") +
+  theme(plot.title = element_text(hjust=0.5)) +
+  annotate('text', x = as.Date('2009-01-01'), y = .7, label = 'Prepaid loans: prepaid / fully paid', col = 'red')+
+  annotate('text', x = as.Date('2009-01-01'), y = .25, label = 'Defaulted loans', col = 'black')+
+  annotate('text', x = as.Date('2018-01-01'), y = .5, label = 'Current loans', col = 'blue')+
+  labs(y="Loan status statistics", x="Loan Issue Date")
+
+print(plt1)
+# with(data_preproc, table(loan_status, status_3way))
+# with(new_data_preproc, table(loan_status, status_3way))
+```
+
+The plots in the figure above show the default rate (charged_off/ (charged_off + Fully_paid)), the fraction of active loans of the total number of loans, and the cumulative curve of the loans not on the book (charged_off or Fully_paid), as of June 30, 2018. Each point refers to loans issued in a specific month-year.
+First, there seems to be a slight increase of the default rate ever time, at least for loans issued before July, 2015. What happens after that time are not *true* default rate but rather they reflect the dynamics of (re)payment. Some people default on their loans and other choose to repay early the loans, both with negative consequences on the investors' revenue. Note that Lending Club does not charge a penalty fee for prepaying a loan.
+
+Since the underlying pattern of loan payment is different from matured loans (we have an average effect) is different from that of un-matured loans, we will use only the matured loans for the modelling phase of our study (from the red trace, they represent ~ 2/3 of data). Also, we will drop the loans issued before 2012, as they were some policy changes around that time. 
+
+Before proceeding to the next step let's investigate the default and prepay counts as a function of months on the book.
+
+```{r, warning = FALSE}
+
+new_data_preproc <- new_data_preproc %>%
+  filter(loan_status %in% c('Charged.Off', 'Fully.Paid'))
+
+vars = c('loan_status', 'status_3way', 'term', 'issue_d', 'grade', 'MOB')
+
+subset <- select(data_preproc, vars) %>% filter(term == '36 months') %>%
+  mutate(year = year(issue_d))
+
+prepaid <- subset %>% filter(status_3way == 'Prepaid')
+
+plt2 <- ggplot(data = prepaid, aes(MOB)) +
+  geom_bar(aes(fill=factor(grade))) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  ggtitle('Prepaid loans by grade and MOB') + xlab('Months on Book')
+
+print(plt2)
+
+## Investigate the defaulted loans
+
+defaulted <- subset %>% filter(status_3way == 'Charged.Off') 
+
+plt3 <- ggplot(data = defaulted[defaulted$MOB <40,], aes(MOB)) +
+  geom_bar(aes(fill=factor(grade))) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  ggtitle('Defaulted loans by grade and MOB') + xlab('Months on Book')
+
+print(plt3)
+# with(data_preproc, table(loan_status, status_3way))
+# with(new_data_preproc, table(loan_status, status_3way))
+```
+
+On average, a borrower default on a 36-month loan after `r round(mean(defaulted$MOB, na.rm = TRUE), 1)` or prepays the loan in `r round(mean(prepaid$MOB, na.rm = TRUE),1)` months.
+
+We also analysed the default and the prepay distribution as a function of MOB and loan grade or the amount borrowed and did not find significant differences between payment patterns. 
+
+Next, we'll reduce the number of observations to include only the matured loans issued after January 1, 2012. This will account for ~ 60% of the loans that were either fully paid or charged off. We chose the January 2012 as our lower limit because some changes were made in Lending Club policy around that time. Technically, there should not be any current loans left.
+
+```{r}
+data_short <- data_preproc %>% filter(issue_d >= ymd('2012-01-01')) %>%
+  filter((term == '36 months' & issue_d < ymd('2015-07-01')) | (term == '60 months' & issue_d < ymd('2013-07-01'))) 
+new_data_short <- new_data_preproc %>% filter(issue_d >= ymd('2015-07-01') & issue_d <= ymd('2015-09-01'))
+
+knitr::kable(table(data_short$term), caption = 'Table2: Frequencies of loan durations')
+# with(data_short, table(loan_status, status_3way))
+```
+
+We have only ~ 5% observations on 60-months loans, we'll continue with the 36-months loans.
+```{r}
+data_short <- data_short %>% filter(term == '36 months') %>%
+  select(-term)
+new_data <- new_data_short %>% filter(term == '36 months') %>%
+  select(-term)
+```
+
+At this point we redefine our research question: **Design a classification algorithm to predict defaulting loans for short period loans offered by Lending Club**
+
+# 2. Data Pre-processing
+
+## Additional feature selection
+In this step we'll remove features based on the following criteria: (a) more than 50% missing values; (b) categorical features with more than 51 levels, and (c) zero- and near-zero variance (95%)
+
+a. missing values
+
+```{r}
+col_nas = apply(is.na(data_short), 2, sum)
+cols_with_nas <- colnames(data_short)[col_nas/nrow(data_short) > 0.5]
+
+data_short <- data_short %>% select(-cols_with_nas)
+new_data <- new_data %>% select(-cols_with_nas)
+
+```
+
+Removed `r length(cols_with_nas)` feature(s).
+
+b. too many levels
+```{r}
+n_levels <- colnames(data_short)[sapply(data_short, function(x) {is.character(x) & (length(unique(x)) > 60)})]
+data_short <- data_short %>% select(-n_levels)
+new_data <- new_data %>% select(-n_levels)
+```
+
+Removed `r length(n_levels)` feature(s).
+
+c. low variance data
+```{r, cached = TRUE}
+low_var <- nearZeroVar(data_short, freqCut = 95/5, saveMetrics = T)
+cols_with_nzv <- setdiff(colnames(data_short)[low_var$nzv], 'recoveries')
+data_short <- data_short %>% select(-cols_with_nzv)
+new_data <- new_data %>% select(-cols_with_nzv)
+```
+
+Dropped `r length(cols_with_nzv)` feature(s).
+
+
+## Add features with socio-economic data
+In this step we create new features that are related to the time the loan was issued or the location (state). This features are:
+
+* unemployment rate (https://download.bls.gov/pub/time.series/ln/ln.data.1.AllData)
+
+* credit card rates (alternative way to obtain credit)
+
+* S&P 500 (indicate the economy's health) (https://ca.finance.yahoo.com/quote/%5EGSPC/history?p=%5EGSPC)
+
+* Treasury Bills (estimate future trends in economy) (https://www.treasury.gov/resource-center/data-chart-center/interest-rates/Pages/TextView.aspx?data=yield)
+
+
+```{r, message = FALSE}
+unemp <-read_csv('C:\\Ryerson Capstone\\data\\unemployment_data_clean.csv')
+tbills <-read_csv('C:\\Ryerson Capstone\\data\\tbills_clean.csv')
+sp500 <- read_csv('C:\\Ryerson Capstone\\data\\SP500_clean.csv')
+creditCards <- read_csv('C:\\Ryerson Capstone\\data\\Credit card avg interest rates.csv')
+
+data_short <- data_short %>% mutate(Date = issue_d) %>% 
+  inner_join(sp500, by = 'Date') %>%
+  inner_join(tbills, by = 'Date') %>%
+  inner_join(creditCards, by = 'Date') %>%
+  inner_join(unemp, by = c('State', 'Date')) %>%
+  select(-Date)
+
+new_data <- new_data %>% mutate(State = addr_state) %>% select(-addr_state)
+new_data <- new_data %>% mutate(Date = issue_d) %>% 
+  inner_join(sp500, by = 'Date') %>%
+  inner_join(tbills, by = 'Date') %>%
+  inner_join(creditCards, by = 'Date') %>%
+  inner_join(unemp, by = c('State', 'Date')) %>%
+  select(-Date)
+```
+
+Some of the added features are strongly correlated. We'll deal with the correlations between the numerical variables at a later stage.
+
+## Calculate the annualized rate of return
+
+Finally, calculate the annualized rate of return for each loan. We will follow the procedure outlined by Cohen et al. (2018) and calculate the rates for three different scenarios:
+
+1. "Pessimistic" scenario: no further investments are made after the re-payments are received (ROI_pes);
+2. "Optimistic" scenario: re-paid installments are invested with the same interest rate (ROI_opt);
+3. "Realistic" scenario: re-paid installments are invested with a fixed interest rate, 2.5% / year (ROI_re);
+
+We have observations where the number of months on the book is larger than 36 months. Since we do not know the payment history of these loans will remove them. This will simplify, also, the calculation of the annualized returns.
+
+```{r, message = F}
+
+data_short <- data_short %>% filter(MOB <= 36)
+new_data <- new_data %>% filter(MOB <= 36)
+
+# pessimistic scenario
+data_short <- data_short %>% mutate(ROI_pes = round((12/36)* (total_pymnt - loan_amnt) / loan_amnt, 4))
+new_data <- new_data %>% mutate(ROI_pes = round((12/36)* (total_pymnt - loan_amnt) / loan_amnt, 4))
+
+
+x <- data_short[which.max(data_short$ROI_pes),]
+
+# optimistic scenario
+
+data_short <- data_short %>%
+  mutate(mobx = ifelse(MOB == 0, 1, MOB), diff = total_pymnt - loan_amnt, 
+                ROI_opt = round(ifelse(diff > 0, 12*diff/(loan_amnt*mobx), 12*diff/ (36*loan_amnt)),4)) %>%
+                select(-mobx, -diff)
+
+new_data <- new_data %>%
+  mutate(mobx = ifelse(MOB == 0, 1, MOB), diff = total_pymnt - loan_amnt, 
+                ROI_opt = round(ifelse(diff > 0, 12*diff/(loan_amnt*mobx), 12*diff/ (36*loan_amnt)),4)) %>%
+                select(-mobx, -diff)
+
+
+# opt_funct <- function(x) {
+#   if (x$MOB > 0){
+#     roi = (12/x$MOB)* (x$total_pymnt - x$loan_amnt) / x$loan_amnt
+#   } else {
+#     roi = -1
+#   }
+#   return(ifelse(roi > 0, roi, x$ROI_pes))
+# }
+# 
+# data_short <- data_short %>% mutate(ROI_opt = opt_funct(.))
+# new_data <- new_data %>% mutate(ROI_opt = opt_funct(.))
+
+# realistic scenario
+re_funct <- function(x, i) {
+  m = ifelse(x$MOB == 0, 1, x$MOB)
+  roi = (12/36)* (1/x$loan_amnt)*(((x$total_pymnt/m)*((1-(1+i)^m)/(1-(1+i)))*(1 + i)^(36-m) - x$loan_amnt))
+
+  return(roi)
+}
+
+data_short <- data_short %>% mutate(ROI_re = round(re_funct(., i = 0.0025),4))
+new_data <- new_data %>% mutate(ROI_re = round(re_funct(., i = 0.0025),4))
+
+
+vars_to_remove <- c('MOB', 'last_pymnt_d', 'total_pymnt', 'recoveries')
+data_short <- data_short %>% select(- vars_to_remove)
+new_data <- new_data %>% select(- vars_to_remove)
+```
+
+Data summary
+```{r}
+var_order <- c("loan_amnt", "int_rate", "installment", "grade", "sub_grade", "purpose", "verification_status",
+               "home_ownership", "emp_length", "annual_inc", "dti", "open_acc",  "total_acc",
+               "pub_rec", "revol_bal", "revol_util", "delinq_2yrs", 'issue_d', "Credit_history",
+               "State", "sp500", "X3_Mo_avg", "X6_Mo_avg", "X1_Yr_avg", "X3_Yr_avg", "X5_Yr_avg",
+               "X10_Yr_avg", "CreditCardAvg", "Unemp_rate", "loan_status", "status_3way", "ROI_pes", "ROI_opt",
+               "ROI_re")
+
+data_short <- data_short %>% select(var_order)
+new_data <- new_data %>% select(var_order)
+
+glimpse(data_short)
+```
+We have now a dataset with `r nrow(data_short)` observation, `r ncol(data_short) - 5` predictive features, and 5 (potential) target variables: *loan_status*, *status_3way*, *ROI_pes*, *ROI_opt*, *ROI_re*.
+
+
+## Split the data into train - validation - test sets
+
+```{r, message = FALSE}
+## SPLIT THE DATA INTO TRAIN/ VALIDATION/ TEST SETS.  We'll deal with the missing values later
+
+set.seed(136)
+
+split <- sample.split(data_short$loan_status, SplitRatio = .6)
+train <- data_short[split==TRUE, ] %>% mutate(set = 'train')
+vt <- data_short[split==FALSE, ]
+
+set.seed(136)
+
+split <- sample.split(vt$loan_status, SplitRatio = .5)
+validation <- vt[split==TRUE,] %>% mutate(set = 'validation')
+test <- vt[split==FALSE,] %>% mutate(set = 'test')
+new_data <- new_data %>% mutate(set = 'new')
+
+data_split <- rbind(train, validation, test)
+all_data <- rbind(train, validation, test, new_data)
+
+write_csv(data_split, 'C:\\Ryerson Capstone\\data\\LC\\data_split.csv')
+write_csv(new_data, 'C:\\Ryerson Capstone\\data\\LC\\new_data.csv')
+write_csv(all_data, 'C:\\Ryerson Capstone\\data\\LC\\all_data.csv')
+```
+
+
+For simplicity, we rename our dataset: data - combined train-validation-test dataset and new_data (after June 2015).
+```{r, cached = TRUE}
+# tmp <- data
+data <- read_csv('C:\\Ryerson Capstone\\data\\LC\\all_data.csv')
+
+train <- data[data$set == 'train',] %>% select(-set)
+
+# clean the work space
+# rm(list = setdiff(ls(), c('data', 'new_data', 'train')))
+```
+
+## Missing data imputation
+```{r Imputation}
+
+imputer <- function(x) {
+  if (is.character(x)) return (names(which.max(table(x))))
+  else return(round(median(x, na.rm = TRUE), 2))
+}
+
+impute_values <- lapply(train[,1:(ncol(train)-5)], imputer)
+
+# save values for feature needs
+save(impute_values, file = 'C:\\Ryerson Capstone\\data\\LC\\impute_values.RData')
+
+for (i in 1:(ncol(data)-6)) {
+    data[is.na(data[[i]]), i] <- impute_values[[i]]
+}
+
+train <- data[data$set == 'train',] %>% select(-set)
+paste('Are NAs in the data? ', anyNA(data))
+```
+
+## Analysis of the numeric independent in the data
+
+### Remove numeric variables that are highly correlated
+```{r}
+library(corrplot)
+
+num.cols <- sapply(train[,1:29], function(x) {is.numeric(x) | is.integer(x)})
+
+pearsoncor <- cor(train[,1:29][num.cols], use="complete.obs")
+corrplot(pearsoncor, method = "number", type = 'lower', tl.cex = 0.7, cl.cex = 0.8)
+
+```
+
+
+```{r}
+#remove features highly correlated (> 0.8), except for ROI's
+features <- c('X3_Mo_avg', 'X6_Mo_avg', 'X5_Yr_avg', 'X1_Yr_avg', 'X10_Yr_avg', 'open_acc', 'installment', 'sp500')
+
+data <- select(data, -features)
+train <- data[data$set == 'train',] %>% select(-set)
+num.cols <- sapply(train[,1:21], function(x) {is.numeric(x) | is.integer(x)})
+
+pearsoncor <- cor(train[,1:21][num.cols], use="complete.obs")
+corrplot(pearsoncor, type = 'upper',tl.pos =  'd')
+corrplot(pearsoncor, add = TRUE, type = 'lower', method = "number", diag = FALSE, tl.pos = 'n', cl.pos = 'n', tl.cex = 0.5)
+
+
+
+# remove outliers
+
+data = data %>% filter(revol_util < 300 & annual_inc < 1000000 & pub_rec < 20 & revol_bal < 1000000)
+```
+
+
+
+Helper functions
+
+```{r helper_for_numeric}
+labels = c("Loan amount", "Interest rate", "Loan grade", "Loan subgrade", "Purpose", 
+           "Verification status", "Home ownership", "Employment length", "Annual income", "Debt-to-Income ratio",
+           "Total accounts", "Public records", "Balance revolving accounts", "% Revolving accounts limit used",
+           "Delinquencies last 2 years", "Loan Issue Date", "Months of credit history", 'State', 
+           "Average rate 3-month T-bills", "Average credit card rate", 
+           "Unemployment rate", 'Loan status', 'Status - 3-way', 'ROI (pessimistic)', 'ROI (optimistic)', 
+           'ROI (realist)')
+
+plot.numeric <- function(index, df = train) {
+
+  plt1 <- ggplot(data = df) +
+    geom_histogram(aes(df[[index]], fill=loan_status)) +
+    theme_bw() +
+    scale_x_continuous() +
+    xlab(labels[index])
+  plt2 <- ggplot(data = df) +
+    geom_boxplot(aes(loan_status, df[[index]])) +
+    coord_flip() +
+    theme_bw() +
+    scale_y_continuous() +
+    scale_x_discrete('Loan Status') +
+    ylab(labels[index])
+  grid.arrange(plt1, plt2, ncol = 1)
+}
+
+transform <- function(vec) {
+  # ref = abs(skewness(vec))
+  Transformation = c('no change', 'square root', 'natural log', 'inverse square root')
+  mat = sapply((vec + .01), function(x) {c(no_change = x, square_root = sqrt(x), log_n = log(x), inv_sq_root = 1/sqrt(x))})
+  skew = apply(mat, 1, skewness)
+  print(data.frame(Skew = round(skew, 3)))
+}
+
+data.transformed <- data %>% select(one_of(c('loan_status', 'set')))
+```
+
+## Numeric data summary
+
+```{r}
+num.cols <- sapply(train, function(x) {is.numeric(x) | is.integer(x)})
+numeric.vars <- train[num.cols]
+default <- train$loan_status == 'Charged.Off'
+
+data.normal <- function(x){
+  if (ad.test(x)$p.value > 0.05){
+    return('TRUE')
+  } else {
+    return('FALSE')
+  }
+}
+wcx <- function(x) {
+  if(wilcox.test(x[default],x[!default])$p.value <= 0.05) {
+    return('TRUE')
+  } else {
+    return('FALSE')
+  }
+}
+
+mins <- round(sapply(numeric.vars, min),1)
+maxs <- round(sapply(numeric.vars, max),1)
+skew <- round(sapply(numeric.vars, skewness),1)
+means <- round(sapply(numeric.vars, mean), 1)
+st.devs <- round(sapply(numeric.vars, sd), 1)
+medians <- round(sapply(numeric.vars, median), 1)
+normality <- sapply(numeric.vars, data.normal)
+Wilcox <- sapply(numeric.vars, wcx)
+
+numeric.summary <- data.frame(Min.Val = mins, Mean = means, Median = medians, Max.Val = maxs,
+                              StDev = st.devs, Skew = skew, Wilcox = Wilcox)
+
+knitr::kable(numeric.summary)
+```
+
+The table above shows the five-number statistics of the numeric variables, as well as the skewness, and the results of the Wilcox test on independenceconditioned on the dependent variable. Data normality test (Anderson - Darling), shows that none of the numerical variables has a normal distribution.
+
+In the following section we'll look at the numeric data distributions conditioned on the *loan_status* dependent variable and apply numerical transformations based on a simplified Box-Cox (like) approach, i.e. find the lowest skewness among raw data (x), logarithm -, square root -, and inverse square root - transformed data. 
+
+## Numerical feature description
+### 1. Loan amount (loan_amnt)
+```{r, message = FALSE}
+plot.numeric(grep('loan_amnt', colnames(train)))
+transform(train$loan_amnt)
+```
+Transformation: square root
+
+```{r}
+data.transformed$loan_amnt <- round(sqrt(data$loan_amnt),4)
+```
+
+### 2. Interest rate (int_rate)
+```{r, message=FALSE}
+plot.numeric(grep('int_rate', colnames(train)))
+transform(train$int_rate)
+```
+Transformation: square root
+
+```{r}
+data.transformed$int_rate <- round(sqrt(data$int_rate), 4)
+```
+
+
+### 3. Annual income (annual_inc)
+
+```{r, message=FALSE}
+plot.numeric(grep('annual_inc', colnames(train)))
+transform(train$annual_inc)
+```
+Transformation: log
+
+```{r}
+data.transformed$annual_inc <- round(log(data$annual_inc + 1), 2)
+```
+
+### 4. Debt-to-Income ratio (dti)
+```{r, message=FALSE}
+plot.numeric(grep('dti', colnames(train)))
+transform(train$dti)
+```
+
+Transformation: None
+
+```{r}
+data.transformed$dti <- data$dti
+```
+
+
+### 5. Total accounts (total_acc)
+```{r, message=FALSE}
+plot.numeric(grep('total_acc', colnames(train)))
+transform(train$total_acc)
+```
+Transformation: square root
+
+```{r}
+data.transformed$total_acc <- round(sqrt(data$total_acc),3)
+```
+
+
+### 6. Public records (pub_rec)
+```{r, message=FALSE}
+plot.numeric(grep('pub_rec', colnames(train)))
+transform(train$pub_rec)
+```
+Transformation: square root
+
+```{r}
+data.transformed$pub_rec <- round(sqrt(data$pub_rec),3)
+```
+
+
+### 7. Revolving balance (revol_bal)
+```{r, message=FALSE}
+plot.numeric(grep('revol_bal', colnames(train)))
+transform(train$revol_bal)
+```
+Transformation: (lambda = 0.25)
+
+```{r}
+data.transformed$revol_bal <- round(data$revol_bal^(1/4),3)
+```
+
+### 8. Revolving utilization ratio (revol_util)
+```{r, message=FALSE}
+plot.numeric(grep('revol_util', colnames(train)))
+transform(train$revol_util)
+```
+Transformation: None
+
+```{r}
+data.transformed$revol_util <- data$revol_util
+```
+
+
+### 9. Delinquencies in the last two years (delinq_2yrs)
+```{r, message=FALSE}
+plot.numeric(grep('delinq_2yrs', colnames(train)))
+transform(train$delinq_2yrs)
+```
+Transformation: log
+
+```{r}
+data.transformed$delinq_2yrs <- round(log(1+data$delinq_2yrs),3)
+```
+
+
+### 10. Lentgh of credit history (Credit_history)
+```{r, message=FALSE}
+plot.numeric(grep('Credit_history', colnames(train)))
+transform(train$Credit_history)
+```
+Transformation: log
+
+```{r}
+data.transformed$Credit_history <- round(log(data$Credit_history),3)
+```
+
+
+### 11. Treasury Bills 3 years interest (X3_Yr_avg)
+```{r, message=FALSE}
+plot.numeric(grep('X3_Yr_avg', colnames(train)))
+transform(train$X3_Yr_avg)
+```
+Transformation: None
+
+```{r}
+data$X3_Yr_avg <- round(data$X3_Yr_avg, 3)
+data.transformed$X3_Yr_avg <- data$X3_Yr_avg
+```
+
+
+### 12. Monthly credit card interest rate (CreditCardAvg)
+```{r, message=FALSE}
+plot.numeric(grep('CreditCardAvg', colnames(train)))
+transform(train$CreditCardAvg)
+```
+Transformation: None
+
+```{r}
+data.transformed$CreditCardAvg <- data$CreditCardAvg
+```
+
+
+
+### 13. Unemployment rate, by state and month-year (Unemp_rate)
+```{r, message=FALSE}
+plot.numeric(grep('Unemp_rate', colnames(train)))
+transform(train$Unemp_rate)
+```
+Transformation: square root
+
+```{r}
+data.transformed$Unemp_rate <- round(sqrt(data$Unemp_rate),3)
+```
+
+
+
+## Analysis of the categorical (factor) independent variables
+
+### Variable independence
+```{r, warning=FALSE}
+factor.cols <- sapply(train, function(x) {is.character(x)})
+
+chisqmatrix <- function(x) {
+  names = colnames(x);  num = length(names)
+  m = matrix(nrow=num,ncol=num,dimnames=list(names,names))
+  for (i in 1:(num-1)) {
+    for (j in (i+1):num) {
+      m[i,j] = chisq.test(x[[i]],x[[j]])$p.value < 0.05
+    }
+  }
+  return (m)
+}
+
+
+x <- train[,factor.cols]
+mat = chisqmatrix(x)
+print(mat)
+```
+It looks that all the categorical variables are independent (we reject H0: no relationship exists between variables). Sounds weird!!!!
+
+Helper functions
+
+```{r}
+factor.vars <- train[!num.cols]
+
+plot.factor <- function(index, df = train) {
+  plt1 <- ggplot(data = df) +
+    geom_bar(aes(df[[index]]), fill='#0047AB') +
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(axis.text.x = element_text(angle=90, hjust = 0.5)) +
+    ggtitle(labels[index]) + xlab('')
+  
+  print(plt1)
+  
+  plt2 <- ggplot(data = df) +
+    geom_bar(aes(df[[index]], fill=loan_status), position = 'fill') +
+    theme_bw() +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    theme(axis.text.x = element_text(angle=90, hjust = 0.5)) +
+    ggtitle(labels[index]) + xlab('')
+  
+  print(plt2)
+  # grid.arrange(plt1, plt2, ncol = 1)
+}
+
+```
+
+
+## Categorical (factor) variables
+### 1. Loan grade (grade)
+```{r}
+# Correlation b/w loan grade and interest rate
+with(train, boxplot(int_rate ~ grade, xlab = 'Grade', ylab = 'Interest rate, %'))
+grade_count <- train %>% select(grade) %>% group_by(grade) %>% summarise(Count = n()) %>% arrange(Count)
+grade_count
+plot.factor(grep('^[g]rade', colnames(train)))
+```
+
+```{r}
+data$grade <- ifelse(data$grade %in% c('E', 'F', 'G'), 'EFG', data$grade)
+data.transformed$grade <- data$grade
+```
+
+### 2. Loan sub-grade (sub_grade)
+```{r}
+with(train, boxplot(int_rate ~ sub_grade, xlab = 'Sub-grade', ylab = 'Interest rate, %'))
+sub_grade_count <- train %>% select(sub_grade) %>% group_by(sub_grade) %>% summarise(Count = n()) %>% arrange(Count)
+sub_grade_count
+plot.factor(grep('sub_grade', colnames(train)))
+```
+
+```{r}
+#Group all the G* sublevels into G
+data$sub_grade <- ifelse(data$grade == 'G', 'G_', data$sub_grade)
+data.transformed$sub_grade <- data$sub_grade
+```
+
+### 3. Loan purpose (purpose)
+```{r}
+purpose_count <- train %>% select(purpose) %>% group_by(purpose) %>% summarise(Count = n()) %>% arrange(Count)
+purpose_count
+plot.factor(grep('purpose', colnames(train)))
+```
+
+```{r}
+data$purpose <- ifelse(data$purpose %in% c('educational', 'renewable_energy'), 'other', data$purpose)
+data.transformed$purpose <- data$purpose
+```
+
+### 4. Verification status (verification_status)
+```{r}
+verification_count <- train %>% select(verification_status) %>% 
+  group_by(verification_status) %>% summarise(Count = n()) %>% arrange(Count)
+verification_count
+plot.factor(grep('verification_status', colnames(train)))
+```
+
+```{r}
+data.transformed$verification_status <- data$verification_status
+```
+
+
+### 5. Home ownership (home_ownership)
+```{r}
+home_count <- train %>% select(home_ownership) %>% 
+  group_by(home_ownership) %>% summarise(Count = n()) %>% arrange(Count)
+home_count
+plot.factor(grep('home_ownership', colnames(train)))
+```
+
+Keep only the major categories.
+```{r}
+data.transformed$home_ownership <- data$home_ownership
+data <- data %>% filter(home_ownership  %in% c('MORTGAGE', 'OWN', 'RENT'))
+data.transformed <- data.transformed %>% filter(home_ownership  %in% c('MORTGAGE', 'OWN', 'RENT'))
+```
+
+### 6. Employment length (emp_length)
+```{r}
+plot.factor(grep('emp_length', colnames(train)))
+```
+Gather the employment length in fewer levels, as below.
+
+```{r}
+data$emp_length <- ifelse(data$emp_length %in% c("< 1 year", "1 year", "2 years"), "up to 2yr", 
+                       ifelse(data$emp_length %in% c("3 years", "4 years", "5 years"), "3-5 yrs", 
+                              ifelse(data$emp_length %in% c("6 years", "7 years", "8 years", "9 years"), "6-9 yrs",
+                                     data$emp_length)))
+
+data.transformed$emp_length <- data$emp_length
+```
+
+
+
+### 7. State (State)
+```{r}
+state_count <- train %>% select(State) %>% group_by(State) %>% summarise(Count = n()) %>% arrange(Count)
+state_count
+
+plot.factor(grep('State', colnames(train)))
+```
+
+```{r}
+data$State <- ifelse(data$State %in% c('ME', 'IA',  'ID', 'NE', 'VT', 'SD', 'ND', 'WY', 'AK', 'DE'), 'other', data$State)
+data.transformed$State <- data$State
+```
+
+
+# Save the final files for the modelling phase
+```{r}
+data.transformed$status_3way <- data$status_3way
+data.transformed$ROI_pes <- data$ROI_pes
+data.transformed$ROI_opt <- data$ROI_opt
+data.transformed$ROI_re <- data$ROI_re
+
+write_csv(data, 'LC_data_untransformed.csv')
+
+write_csv(data.transformed, 'LC_data_transformed.csv')
+```
+
+# Further feature selection using the Boruta package
+
+```{r Boruta, cached = TRUE, message = FALSE}
+library(Boruta)
+set.seed(101)
+
+if(file.exists('C:\\Ryerson Capstone\\data\\LC\\boruta.RData')) {
+  load('C:\\Ryerson Capstone\\data\\LC\\boruta.RData')
+} else {
+  boruta.train <- Boruta(factor(loan_status) ~., data = train[,1:23], doTrace = 2)
+}
+
+print(boruta.train)
+save(boruta.train, file = 'C:\\Ryerson Capstone\\data\\LC\\boruta.RData')
+```
+
+Feature evaluation using the CORElear package.
+
+```{r}
+library(CORElearn)
+
+Gini <- attrEval(factor(loan_status) ~ ., select(train, -status_3way, -ROI_pes, -ROI_opt, -ROI_re), estimator="Gini")
+GainRatio <- attrEval(factor(loan_status) ~ ., select(train, -status_3way, -ROI_pes, -ROI_opt, -ROI_re), estimator="GainRatio")
+dotplot(sort(Gini, decreasing = TRUE), xlab = 'Gini Index')
+dotplot(sort(GainRatio, decreasing = TRUE), xlab = 'Gain Ratio')
+```
+
+Unfortunately, we don't have strong predictors for the target variables among our independent features. Moreover, the best predictors come from the parameters set by Lending Club: grade, subgrade, and interest rate. Since state is a week predictor it will be dropped and keep only the geographic are. Also, because the grade and subgrade are correlated will focus on subgrade.
+
+# References
+Cohen, Maxime C., Guetta, C. Daniel, Jiao, Kevin, & Provost, Foster. (2018). Data-Driven Investment Strategies for Peer-to-Peer Lending: A Case Study for Teaching Data Science. Big Data, 6(3), 191-213. doi: 10.1089/big.2018.0092
